@@ -1,0 +1,9 @@
+export type User = { id: string; email: string; timeZone: string; createdAt: string };
+export type SessionResponse = { user: User; expiresAt: string };
+export type Habit = { id: string; name: string; description: string; startDate: string; createdAt: string; updatedAt: string; currentStreak: number; todayCompleted: boolean; recentCompletedDates: string[] };
+export type HabitsResponse = { habits: Habit[]; today: string; timeZone: string; limit: 25 };
+export type HabitResponse = { habit: Habit; today: string; timeZone: string };
+export type CalendarResponse = HabitResponse & { month: string; completedDates: string[]; completedCount: number; daysInMonth: number; completionPercent: number; editableFrom: string; editableTo: string };
+export type CompletionResponse = HabitResponse & { date: string; completed: boolean };
+export type ErrorEnvelope = { error: { code: string; message: string; details?: Record<string,string> }; requestId: string };
+export type HabitInput = { name: string; description: string };

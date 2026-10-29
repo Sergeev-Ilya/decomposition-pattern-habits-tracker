@@ -1,0 +1,117 @@
+name: ritm
+
+services:
+  auth-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ritm_auth
+      POSTGRES_DB: ritm_auth
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:?Run node scripts/init-local-env.mjs}
+    volumes:
+      - auth_data:/var/lib/postgresql
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U ritm_auth -d ritm_auth]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+  habits-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ritm_habits
+      POSTGRES_DB: ritm_habits
+      POSTGRES_PASSWORD: ${HABITS_DB_PASSWORD:?Run node scripts/init-local-env.mjs}
+    volumes:
+      - habits_data:/var/lib/postgresql
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U ritm_habits -d ritm_habits]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+  auth-service:
+    image: ritm-auth-service:local
+    build: ./auth-service
+    environment:
+      PORT: 3000
+      APP_ORIGIN: ${APP_ORIGIN:?Run node scripts/init-local-env.mjs}
+      DATABASE_URL: postgresql://ritm_auth:${AUTH_DB_PASSWORD:?Run node scripts/init-local-env.mjs}@auth-db:5432/ritm_auth
+      JWT_SECRET: ${JWT_SECRET:?Run node scripts/init-local-env.mjs}
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:?Run node scripts/init-local-env.mjs}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    depends_on:
+      auth-db: {condition: service_healthy}
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+      start_period: 10s
+  habits-service:
+    image: ritm-habits-service:local
+    build: ./habits-service
+    environment:
+      PORT: 3000
+      APP_ORIGIN: ${APP_ORIGIN:?Run node scripts/init-local-env.mjs}
+      DATABASE_URL: postgresql://ritm_habits:${HABITS_DB_PASSWORD:?Run node scripts/init-local-env.mjs}@habits-db:5432/ritm_habits
+      JWT_SECRET: ${JWT_SECRET:?Run node scripts/init-local-env.mjs}
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:?Run node scripts/init-local-env.mjs}
+      AUTH_SERVICE_URL: http://auth-service:3000
+    depends_on:
+      habits-db: {condition: service_healthy}
+      auth-service: {condition: service_healthy}
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+      start_period: 10s
+  api-gateway:
+    image: ritm-api-gateway:local
+    build: ./api-gateway
+    environment:
+      PORT: 8080
+      APP_ORIGIN: ${APP_ORIGIN:?Run node scripts/init-local-env.mjs}
+      AUTH_SERVICE_URL: http://auth-service:3000
+      HABITS_SERVICE_URL: http://habits-service:3000
+    depends_on:
+      auth-service: {condition: service_healthy}
+      habits-service: {condition: service_healthy}
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+      start_period: 10s
+  frontend:
+    image: ritm-frontend:local
+    build: ../frontend
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8880}:80"
+    depends_on:
+      api-gateway: {condition: service_healthy}
+    networks: [app]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/health]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+      start_period: 10s
+
+networks:
+  app:
+
+volumes:
+  auth_data:
+  habits_data:

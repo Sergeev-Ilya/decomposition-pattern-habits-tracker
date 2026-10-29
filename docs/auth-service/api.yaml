@@ -1,0 +1,346 @@
+openapi: 3.1.0
+info:
+  title: Ритм — auth-service API
+  version: 1.0.0
+  description: |
+    Регистрация, вход и отзывные сессии из docs/architecture.md.
+    Публичные /api/auth/* доступны браузеру только через единый origin frontend.
+    /internal/* доступен лишь внутри Compose и не публикуется gateway.
+    DTO используют camelCase, время — UTC RFC 3339. Пароли и JWT не возвращаются в JSON.
+    Все публичные изменяющие запросы требуют Origin, точно равный APP_ORIGIN;
+    отсутствующий, null или чужой Origin даёт 403. CORS для внешних origin не включён.
+    Тело ограничено 16 KiB; непустое тело требует application/json.
+    Неизвестные поля JSON и повторяющиеся cookie ritm_session отклоняются.
+    Ответы авторизации и профиля имеют Cache-Control: no-store.
+servers:
+  - url: http://auth-service:3000
+    description: Внутренняя сеть Compose; публичные пути проксируются без изменения
+tags:
+  - name: Auth
+  - name: Internal
+  - name: Health
+security: []
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getAuthHealth
+      summary: Готовность сервиса, миграций и собственной БД
+      responses:
+        '200':
+          description: Миграции завершены, запрос к PostgreSQL успешен
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, service]
+                properties:
+                  status: {type: string, const: ok}
+                  service: {type: string, const: auth-service}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Создать аккаунт; вход выполняется отдельно
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRequest'}
+            example:
+              email: reader@example.com
+              password: example-passphrase
+              timeZone: Europe/Moscow
+      responses:
+        '201':
+          description: Аккаунт создан. Cookie сессии не устанавливается
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [user]
+                properties:
+                  user: {$ref: '#/components/schemas/User'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '409':
+          description: EMAIL_TAKEN — нормализованный email уже занят
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginUser
+      summary: Проверить пароль и создать сессию на семь суток
+      description: |
+        Email нормализуется trim + lowercase; пароль не изменяется.
+        Неизвестный email и неправильный пароль дают одинаковый INVALID_CREDENTIALS.
+        Сессия и JWT истекают одновременно через 604800 секунд; refresh-token нет.
+        JWT HS256 содержит sub, sid, iss=ritm-auth, aud=ritm-app, iat, exp.
+        Подпись и issuer/audience/algorithm проверяются строго.
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200':
+          description: Сессия сохранена в БД; JWT выдан только через HttpOnly-cookie
+          headers:
+            Set-Cookie:
+              description: |
+                ritm_session; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800.
+                Domain отсутствует. Secure=false только в согласованном локальном HTTP;
+                при HTTPS Secure=true. Значение не копируется в JSON или Web Storage.
+              schema: {type: string}
+              example: 'ritm_session=<signed-jwt>; Max-Age=604800; Path=/; HttpOnly; SameSite=Lax'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401':
+          description: INVALID_CREDENTIALS — неверный email или пароль
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+              example:
+                error: {code: INVALID_CREDENTIALS, message: Неверный email или пароль}
+                requestId: 8e4bbd73-ac3f-47f6-bf95-48384e4feaa8
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/auth/session:
+    get:
+      tags: [Auth]
+      operationId: getCurrentSession
+      summary: Проверить JWT и активность сессии, получить безопасный профиль
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: JWT действителен, сессия не отозвана и не истекла
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logoutUser
+      summary: Отозвать текущую сессию и очистить cookie
+      description: |
+        Origin обязателен. Тело запроса не требуется.
+        Отсутствующий, неверный, истёкший или уже отозванный JWT допускает 204
+        с очисткой cookie. При действительном JWT отзыв коммитится до ответа.
+        Недоступность БД при проверке/отзыве даёт 503, а не успешный выход.
+        Другие сессии пользователя сохраняются. Cookie очищается с теми же Path,
+        HttpOnly, SameSite и Secure; Max-Age=0 или Expires в прошлом.
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      security:
+        - SessionCookie: []
+        - {}
+      responses:
+        '204':
+          description: Текущая сессия отозвана либо уже недействительна
+          headers:
+            Set-Cookie:
+              description: Очистка ritm_session с Path=/ и атрибутами исходной cookie
+              schema: {type: string}
+              example: 'ritm_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /internal/sessions/verify:
+    post:
+      tags: [Internal]
+      operationId: verifyInternalSession
+      summary: Проверить JWT и persisted session для habits-service
+      description: |
+        Недоступен через публичный gateway. Требует X-Service-Key, равный
+        INTERNAL_SERVICE_KEY, и JWT в JSON. Origin и браузерная cookie не используются.
+        Сначала проверяется service-key, затем подпись HS256, iss/aud/exp/sub/sid
+        и строка сессии с тем же user_id. Отсутствующая/отозванная/истёкшая сессия — 401.
+        Подтверждённый timeZone читается из users; сведения о пароле и email не передаются.
+      security:
+        - ServiceKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token: {type: string, minLength: 1, maxLength: 4096, writeOnly: true}
+      responses:
+        '200':
+          description: Подтверждённая идентичность и действующая сессия
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/VerifiedIdentity'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: INVALID_SERVICE_KEY — service-key отсутствует или неверен
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: ritm_session
+      description: Подписанный HS256 JWT; активность persisted session проверяется на каждом защищённом запросе
+    ServiceKey:
+      type: apiKey
+      in: header
+      name: X-Service-Key
+      description: Отдельный случайный INTERNAL_SERVICE_KEY; не JWT-secret и не браузерные данные
+  parameters:
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      description: Точное значение APP_ORIGIN, включая схему и порт; не вычисляется из Host
+      schema: {type: string, format: uri}
+      example: http://localhost:8880
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, timeZone]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Валидация email и длины выполняется после trim + lowercase
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+          description: Без trim/normalization, без требования специальных классов символов
+        timeZone:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Поддерживаемая runtime IANA-зона браузера, включая UTC; навсегда сохраняется в аккаунте
+          example: Europe/Moscow
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: trim + lowercase перед проверкой и поиском
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+          description: При входе короткий неверный пароль даёт INVALID_CREDENTIALS, а не раскрытие аккаунта
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, email, timeZone, createdAt]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string, format: email, maxLength: 254}
+        timeZone: {type: string, example: Europe/Moscow}
+        createdAt: {type: string, format: date-time}
+    SessionResponse:
+      type: object
+      additionalProperties: false
+      required: [user, expiresAt]
+      properties:
+        user: {$ref: '#/components/schemas/User'}
+        expiresAt: {type: string, format: date-time}
+      example:
+        user:
+          id: a59e856b-cbf5-4906-a185-e70b3fb731b8
+          email: reader@example.com
+          timeZone: Europe/Moscow
+          createdAt: '2026-10-29T09:00:00Z'
+        expiresAt: '2026-11-05T09:00:00Z'
+    VerifiedIdentity:
+      type: object
+      additionalProperties: false
+      required: [userId, sessionId, timeZone, expiresAt]
+      properties:
+        userId: {type: string, format: uuid}
+        sessionId: {type: string, format: uuid}
+        timeZone: {type: string}
+        expiresAt: {type: string, format: date-time}
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: {type: string, pattern: '^[A-Z][A-Z0-9_]*$'}
+            message: {type: string}
+            details:
+              type: object
+              description: Только безопасные ошибки полей; значения пароля, токена, cookie и service-key не включаются
+              additionalProperties: {type: string}
+        requestId: {type: string, format: uuid}
+  responses:
+    BadRequest:
+      description: VALIDATION_ERROR — невалидный JSON/поля, неизвестное поле или неподдерживаемый часовой пояс
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unauthorized:
+      description: UNAUTHENTICATED — JWT отсутствует/неверен/истёк либо сессия отозвана/истекла
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    ForbiddenOrigin:
+      description: ORIGIN_FORBIDDEN — Origin отсутствует, равен null или не совпадает с APP_ORIGIN
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    TooLarge:
+      description: PAYLOAD_TOO_LARGE — тело превышает 16 KiB
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    UnsupportedMedia:
+      description: UNSUPPORTED_MEDIA_TYPE — непустое тело не имеет Content-Type application/json
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unavailable:
+      description: SERVICE_UNAVAILABLE — БД недоступна или readiness ещё не достигнут; детали инфраструктуры скрыты
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}

@@ -1,0 +1,452 @@
+openapi: 3.1.0
+info:
+  title: Ритм — habits-service API
+  version: 1.0.0
+  description: |
+    Привычки, календарные выполнения, текущая серия и месячная статистика.
+    Публичные пути доступны браузеру через same-origin gateway. На каждом запросе
+    сервис проверяет HS256 JWT и активную сессию через auth-service; X-User-* не доверены.
+    Все ответы с личными данными имеют Cache-Control: no-store. DTO — camelCase.
+    Сегодня определяется сервером в подтверждённом часовом поясе аккаунта.
+    POST/PATCH/PUT/DELETE требуют точный Origin=APP_ORIGIN. Непустое тело — JSON,
+    максимум 16 KiB; неизвестные поля отклоняются. Клиент не задаёт owner/startDate/today/TZ.
+    Даты — существующие григорианские YYYY-MM-DD с годом 0001..9999; timestamps — UTC RFC 3339.
+servers:
+  - url: http://habits-service:3000
+    description: Внутренняя сеть Compose; публичные пути проксируются без изменения
+tags:
+  - name: Habits
+  - name: Calendar
+  - name: Health
+security:
+  - SessionCookie: []
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHabitsHealth
+      summary: Готовность миграций и собственной PostgreSQL
+      security: []
+      responses:
+        '200':
+          description: Миграции завершены и запрос к собственной БД успешен
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, service]
+                properties:
+                  status: {type: string, const: ok}
+                  service: {type: string, const: habits-service}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/habits:
+    get:
+      tags: [Habits]
+      operationId: listHabits
+      summary: Все существующие привычки текущего пользователя, максимум 25
+      description: |
+        Стабильный порядок created_at ASC, id ASC. Пагинация не требуется.
+        recentCompletedDates ограничены [D-6,D] и нужны недельному обзору;
+        currentStreak вычисляется сервером по полной истории, но история не передаётся списком.
+        Для пустого аккаунта habits=[]; серверные today/timeZone возвращаются и в этом случае.
+      responses:
+        '200':
+          description: Список владельца и серверный календарный контекст
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HabitsResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      tags: [Habits]
+      operationId: createHabit
+      summary: Создать привычку, если существующих меньше 25
+      description: |
+        startDate фиксируется сервером в часовом поясе пользователя после получения
+        транзакционной блокировки владельца. Конкурентные создания сериализуются:
+        лимит 25 соблюдается независимо от интерфейса. Имя после trim обязательно.
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateHabitRequest'}
+            example: {name: Читать 20 минут, description: Несколько страниц каждый вечер}
+      responses:
+        '201':
+          description: Привычка создана с пустой историей
+          headers:
+            Location:
+              description: Публичный относительный API URL созданной привычки
+              schema: {type: string}
+              example: /api/habits/56b1f554-bccc-4c4d-a7ac-91b44c821dd1
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HabitResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '409':
+          description: HABIT_LIMIT_REACHED — уже существует 25 привычек
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/habits/{habitId}:
+    parameters:
+      - {$ref: '#/components/parameters/HabitId'}
+    get:
+      tags: [Habits]
+      operationId: getHabit
+      summary: Прочитать собственную привычку и её актуальную серию
+      responses:
+        '200':
+          description: Сводка привычки без полной истории выполнений
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HabitResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    patch:
+      tags: [Habits]
+      operationId: updateHabit
+      summary: Изменить название и/или описание, сохранив дату начала и историю
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateHabitRequest'}
+      responses:
+        '200':
+          description: Обновлённая сводка; непереданные поля не изменены
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HabitResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      tags: [Habits]
+      operationId: deleteHabit
+      summary: Удалить собственную привычку вместе со всеми выполнениями
+      description: |
+        Подтверждение получает frontend в диалоге; дополнительного поля confirmed нет.
+        Удаление транзакционное и освобождает слот. Архивирования/восстановления нет.
+        Повторное удаление отсутствующей привычки даёт тот же 404, что чужая привычка.
+        Тело запроса не требуется.
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      responses:
+        '204': {description: Привычка и история удалены, слот освобождён}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/habits/{habitId}/calendar:
+    parameters:
+      - {$ref: '#/components/parameters/HabitId'}
+    get:
+      tags: [Calendar]
+      operationId: getHabitCalendar
+      summary: Выполнения и статистика выбранного календарного месяца
+      description: |
+        Без month используется текущий месяц в часовом поясе аккаунта.
+        Переданный month должен быть валидным и принадлежать диапазону от месяца
+        создания привычки до текущего включительно; иначе 400. Frontend нормализует
+        некорректный URL к текущему месяцу до повторного запроса.
+        currentStreak внутри habit всегда относится к today, не к выбранному месяцу.
+        editableFrom/To описывают общее окно привычки, не пересечение с выбранным месяцем.
+        completedDates содержит только даты выбранного месяца, включая старые readonly.
+      parameters:
+        - name: month
+          in: query
+          required: false
+          description: YYYY-MM, годы 0001..9999; не раньше создания и не позже текущего месяца
+          schema: {$ref: '#/components/schemas/CalendarMonth'}
+          example: '2026-10'
+      responses:
+        '200':
+          description: Согласованный снимок привычки, месяца и календарного контекста
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CalendarResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/habits/{habitId}/completions/{date}:
+    parameters:
+      - {$ref: '#/components/parameters/HabitId'}
+      - name: date
+        in: path
+        required: true
+        description: Существующая календарная дата YYYY-MM-DD; проверяется round-trip, а не только regex
+        schema: {$ref: '#/components/schemas/CalendarDate'}
+    put:
+      tags: [Calendar]
+      operationId: setHabitCompletion
+      summary: Установить желаемое состояние выполнения даты, идемпотентно
+      description: |
+        completed=true создаёт отметку только при её отсутствии; false удаляет её,
+        если существует. Повтор того же запроса не переключает состояние и даёт 200.
+        Дата обязана быть в [max(startDate,D-7),D] включительно. Проверка выполняется
+        после блокировки привычки с заново определённым серверным D.
+        Невозможная/неправильно записанная дата — VALIDATION_ERROR (400);
+        существующая дата вне окна — DATE_NOT_EDITABLE (400), даже для no-op снятия.
+        Ответ содержит подтверждённую сводку; frontend перечитывает выбранный календарь.
+      parameters:
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [completed]
+              properties:
+                completed: {type: boolean}
+            example: {completed: true}
+      responses:
+        '200':
+          description: Подтверждённое состояние и актуальная сводка привычки
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CompletionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrigin'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: ritm_session
+      description: HS256 JWT и persisted session, подтверждённая auth-service на каждом запросе
+  parameters:
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      description: Точное значение APP_ORIGIN, включая схему и порт; не вычисляется из Host
+      schema: {type: string, format: uri}
+      example: http://localhost:8880
+    HabitId:
+      name: habitId
+      in: path
+      required: true
+      description: UUID привычки; чужой UUID не раскрывает её существование
+      schema: {type: string, format: uuid}
+  schemas:
+    CalendarDate:
+      type: string
+      format: date
+      pattern: '^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
+      description: Реальная григорианская дата; например 2026-02-30 запрещено
+    CalendarMonth:
+      type: string
+      pattern: '^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])$'
+    CreateHabitRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: trim перед проверкой; 1–120 Unicode-кодовых точек после trim
+        description:
+          type: string
+          maxLength: 2000
+          default: ''
+          description: Необязательная строка; trim, максимум 2000 Unicode-кодовых точек; null запрещён
+    UpdateHabitRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: trim перед проверкой; пустое название запрещено
+        description:
+          type: string
+          maxLength: 2000
+          description: trim; пустая строка очищает описание; null запрещён
+    HabitSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name, description, startDate, createdAt, updatedAt, currentStreak, todayCompleted, recentCompletedDates]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string, minLength: 1, maxLength: 120}
+        description: {type: string, maxLength: 2000}
+        startDate: {$ref: '#/components/schemas/CalendarDate'}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        currentStreak:
+          type: integer
+          minimum: 0
+          description: Непрерывная серия до D, если D выполнен; иначе до D-1; при отсутствии обеих отметок 0
+        todayCompleted: {type: boolean}
+        recentCompletedDates:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/CalendarDate'}
+          description: Только выполненные даты [D-6,D], не ранее startDate, по возрастанию
+    HabitsResponse:
+      type: object
+      additionalProperties: false
+      required: [habits, today, timeZone, limit]
+      properties:
+        habits:
+          type: array
+          maxItems: 25
+          items: {$ref: '#/components/schemas/HabitSummary'}
+        today: {$ref: '#/components/schemas/CalendarDate'}
+        timeZone: {type: string}
+        limit: {type: integer, const: 25}
+    HabitResponse:
+      type: object
+      additionalProperties: false
+      required: [habit, today, timeZone]
+      properties:
+        habit: {$ref: '#/components/schemas/HabitSummary'}
+        today: {$ref: '#/components/schemas/CalendarDate'}
+        timeZone: {type: string}
+    CalendarResponse:
+      type: object
+      additionalProperties: false
+      required: [habit, month, completedDates, completedCount, daysInMonth, completionPercent, editableFrom, editableTo, today, timeZone]
+      properties:
+        habit: {$ref: '#/components/schemas/HabitSummary'}
+        month: {$ref: '#/components/schemas/CalendarMonth'}
+        completedDates:
+          type: array
+          maxItems: 31
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/CalendarDate'}
+          description: Только выбранный месяц; уникальные даты по возрастанию
+        completedCount: {type: integer, minimum: 0, maximum: 31}
+        daysInMonth: {type: integer, minimum: 28, maximum: 31}
+        completionPercent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: completedCount / daysInMonth * 100, без серверного округления; UI показывает один десятичный знак
+        editableFrom:
+          $ref: '#/components/schemas/CalendarDate'
+          description: max(startDate,D-7), независимо от выбранного месяца
+        editableTo:
+          $ref: '#/components/schemas/CalendarDate'
+          description: D в подтверждённом часовом поясе аккаунта
+        today: {$ref: '#/components/schemas/CalendarDate'}
+        timeZone: {type: string}
+      example:
+        habit:
+          id: 56b1f554-bccc-4c4d-a7ac-91b44c821dd1
+          name: Читать 20 минут
+          description: Несколько страниц каждый вечер
+          startDate: '2026-10-01'
+          createdAt: '2026-10-01T07:00:00Z'
+          updatedAt: '2026-10-29T07:00:00Z'
+          currentStreak: 3
+          todayCompleted: true
+          recentCompletedDates: ['2026-10-27', '2026-10-28', '2026-10-29']
+        month: '2026-10'
+        completedDates: ['2026-10-27', '2026-10-28', '2026-10-29']
+        completedCount: 3
+        daysInMonth: 31
+        completionPercent: 9.67741935483871
+        editableFrom: '2026-10-22'
+        editableTo: '2026-10-29'
+        today: '2026-10-29'
+        timeZone: Europe/Moscow
+    CompletionResponse:
+      type: object
+      additionalProperties: false
+      required: [habit, date, completed, today, timeZone]
+      properties:
+        habit: {$ref: '#/components/schemas/HabitSummary'}
+        date: {$ref: '#/components/schemas/CalendarDate'}
+        completed: {type: boolean}
+        today: {$ref: '#/components/schemas/CalendarDate'}
+        timeZone: {type: string}
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: {type: string, pattern: '^[A-Z][A-Z0-9_]*$'}
+            message: {type: string}
+            details:
+              type: object
+              description: Только безопасные ошибки полей; секреты и внутренние SQL-детали не включаются
+              additionalProperties: {type: string}
+        requestId: {type: string, format: uuid}
+  responses:
+    BadRequest:
+      description: VALIDATION_ERROR — неверные поля/UUID/JSON/дата/месяц; MONTH_OUT_OF_RANGE — месяц вне диапазона; DATE_NOT_EDITABLE — дата вне разрешённого окна
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unauthorized:
+      description: UNAUTHENTICATED — JWT отсутствует/неверен/истёк либо сессия неактивна
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    ForbiddenOrigin:
+      description: ORIGIN_FORBIDDEN — Origin отсутствует, равен null или не совпадает с APP_ORIGIN
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    NotFound:
+      description: HABIT_NOT_FOUND — одинаковый ответ для неизвестной, удалённой и чужой привычки
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+          example:
+            error: {code: HABIT_NOT_FOUND, message: Привычка не найдена}
+            requestId: 8e4bbd73-ac3f-47f6-bf95-48384e4feaa8
+    TooLarge:
+      description: PAYLOAD_TOO_LARGE — тело превышает 16 KiB
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    UnsupportedMedia:
+      description: UNSUPPORTED_MEDIA_TYPE — непустое тело не имеет Content-Type application/json
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unavailable:
+      description: SERVICE_UNAVAILABLE — PostgreSQL/auth-service недоступен, ответ внутренней проверки некорректен либо readiness не достигнут; доступ не разрешается
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}

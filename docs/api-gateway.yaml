@@ -1,0 +1,1039 @@
+---
+openapi: 3.1.0
+info:
+  title: Ритм — публичный API Gateway
+  version: 1.0.0
+  description: |
+    Самодостаточный публичный контракт frontend: единый origin, относительные /api/*.
+    Фактический origin и порт задаются при локальном запуске; servers=/ не заявляет работающий URL.
+    JWT передаётся только cookie ritm_session (HttpOnly, SameSite=Lax, Path=/), не JSON/Bearer/Web Storage.
+    Сервисы самостоятельно проверяют JWT и persisted session; gateway не заменяет авторизацию.
+    POST/PATCH/PUT/DELETE требуют точный Origin=APP_ORIGIN. Пустой, отсутствующий, null и чужой Origin дают 403.
+    APP_ORIGIN берётся из конфигурации, не из Host/X-Forwarded-*; внешние CORS origin не разрешены.
+    Максимум тела 16 KiB; непустое тело требует application/json. Путь и query сохраняются при proxy.
+    Gateway создаёт UUID requestId, передаёт X-Request-Id upstream и возвращает тот же идентификатор.
+    Клиентские X-User-*, X-Service-Key и Authorization не используются для идентичности и удаляются до proxy.
+    Cookie и отдельные Set-Cookie передаются без изменения атрибутов; токены/пароли/секреты не логируются.
+    Неизвестный публичный API-путь/метод и /internal/* дают JSON 404, не SPA fallback.
+    Недоступность/timeout/некорректный ответ upstream дают 503 SERVICE_UNAVAILABLE в общем формате.
+    Автоматических повторов запросов нет; таймаут публичного upstream 5000 ms, readiness 2000 ms.
+    Публичные маршруты не включают внутренний POST /internal/sessions/verify.
+servers:
+- url: "/"
+  description: Origin frontend; фактический localhost-порт выбирается при запуске
+tags:
+- name: Auth
+- name: Habits
+- name: Calendar
+- name: Health
+security:
+- SessionCookie: []
+x-source-contracts:
+- auth-service/api.yaml
+- habits-service/api.yaml
+x-routing:
+  auth:
+    prefix: "/api/auth/"
+    upstream: http://auth-service:3000
+    preservePath: true
+  habits:
+    prefixPattern: "^/api/habits(?:/|$)"
+    upstream: http://habits-service:3000
+    preservePath: true
+  health:
+    path: "/health"
+    strategy: GET /health обоих upstream; оба должны вернуть 200 и корректный status=ok
+  internal:
+    prefix: "/internal/"
+    action: JSON 404 NOT_FOUND; никогда не proxy
+  unknownApi:
+    action: JSON 404 NOT_FOUND; никогда не index.html
+paths:
+  "/api/auth/register":
+    post:
+      tags:
+      - Auth
+      operationId: registerUser
+      summary: Создать аккаунт; вход выполняется отдельно
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/RegisterRequest"
+            example:
+              email: reader@example.com
+              password: example-passphrase
+              timeZone: Europe/Moscow
+      responses:
+        '201':
+          description: Аккаунт создан. Cookie сессии не устанавливается
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                - user
+                properties:
+                  user:
+                    "$ref": "#/components/schemas/User"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '409':
+          description: EMAIL_TAKEN — нормализованный email уже занят
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorEnvelope"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security: []
+    x-upstream: http://auth-service:3000
+    x-preserve-path: true
+  "/api/auth/login":
+    post:
+      tags:
+      - Auth
+      operationId: loginUser
+      summary: Проверить пароль и создать сессию на семь суток
+      description: |
+        Email нормализуется trim + lowercase; пароль не изменяется.
+        Неизвестный email и неправильный пароль дают одинаковый INVALID_CREDENTIALS.
+        Сессия и JWT истекают одновременно через 604800 секунд; refresh-token нет.
+        JWT HS256 содержит sub, sid, iss=ritm-auth, aud=ritm-app, iat, exp.
+        Подпись и issuer/audience/algorithm проверяются строго.
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/LoginRequest"
+      responses:
+        '200':
+          description: Сессия сохранена в БД; JWT выдан только через HttpOnly-cookie
+          headers:
+            Set-Cookie:
+              description: |
+                ritm_session; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800.
+                Domain отсутствует. Secure=false только в согласованном локальном HTTP;
+                при HTTPS Secure=true. Значение не копируется в JSON или Web Storage.
+              schema:
+                type: string
+              example: ritm_session=<signed-jwt>; Max-Age=604800; Path=/; HttpOnly;
+                SameSite=Lax
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/SessionResponse"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          description: INVALID_CREDENTIALS — неверный email или пароль
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              example:
+                error:
+                  code: INVALID_CREDENTIALS
+                  message: Неверный email или пароль
+                requestId: 8e4bbd73-ac3f-47f6-bf95-48384e4feaa8
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security: []
+    x-upstream: http://auth-service:3000
+    x-preserve-path: true
+  "/api/auth/session":
+    get:
+      tags:
+      - Auth
+      operationId: getCurrentSession
+      summary: Проверить JWT и активность сессии, получить безопасный профиль
+      security:
+      - SessionCookie: []
+      responses:
+        '200':
+          description: JWT действителен, сессия не отозвана и не истекла
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/SessionResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+    x-upstream: http://auth-service:3000
+    x-preserve-path: true
+  "/api/auth/logout":
+    post:
+      tags:
+      - Auth
+      operationId: logoutUser
+      summary: Отозвать текущую сессию и очистить cookie
+      description: |
+        Origin обязателен. Тело запроса не требуется.
+        Отсутствующий, неверный, истёкший или уже отозванный JWT допускает 204
+        с очисткой cookie. При действительном JWT отзыв коммитится до ответа.
+        Недоступность БД при проверке/отзыве даёт 503, а не успешный выход.
+        Другие сессии пользователя сохраняются. Cookie очищается с теми же Path,
+        HttpOnly, SameSite и Secure; Max-Age=0 или Expires в прошлом.
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      security:
+      - SessionCookie: []
+      - {}
+      responses:
+        '204':
+          description: Текущая сессия отозвана либо уже недействительна
+          headers:
+            Set-Cookie:
+              description: Очистка ritm_session с Path=/ и атрибутами исходной cookie
+              schema:
+                type: string
+              example: ritm_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+    x-upstream: http://auth-service:3000
+    x-preserve-path: true
+  "/api/habits":
+    get:
+      tags:
+      - Habits
+      operationId: listHabits
+      summary: Все существующие привычки текущего пользователя, максимум 25
+      description: |
+        Стабильный порядок created_at ASC, id ASC. Пагинация не требуется.
+        recentCompletedDates ограничены [D-6,D] и нужны недельному обзору;
+        currentStreak вычисляется сервером по полной истории, но история не передаётся списком.
+        Для пустого аккаунта habits=[]; серверные today/timeZone возвращаются и в этом случае.
+      responses:
+        '200':
+          description: Список владельца и серверный календарный контекст
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HabitsResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    post:
+      tags:
+      - Habits
+      operationId: createHabit
+      summary: Создать привычку, если существующих меньше 25
+      description: |
+        startDate фиксируется сервером в часовом поясе пользователя после получения
+        транзакционной блокировки владельца. Конкурентные создания сериализуются:
+        лимит 25 соблюдается независимо от интерфейса. Имя после trim обязательно.
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CreateHabitRequest"
+            example:
+              name: Читать 20 минут
+              description: Несколько страниц каждый вечер
+      responses:
+        '201':
+          description: Привычка создана с пустой историей
+          headers:
+            Location:
+              description: Публичный относительный API URL созданной привычки
+              schema:
+                type: string
+              example: "/api/habits/56b1f554-bccc-4c4d-a7ac-91b44c821dd1"
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HabitResponse"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '409':
+          description: HABIT_LIMIT_REACHED — уже существует 25 привычек
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorEnvelope"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    x-upstream: http://habits-service:3000
+    x-preserve-path: true
+  "/api/habits/{habitId}":
+    parameters:
+    - "$ref": "#/components/parameters/HabitId"
+    get:
+      tags:
+      - Habits
+      operationId: getHabit
+      summary: Прочитать собственную привычку и её актуальную серию
+      responses:
+        '200':
+          description: Сводка привычки без полной истории выполнений
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HabitResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '404':
+          "$ref": "#/components/responses/NotFound"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    patch:
+      tags:
+      - Habits
+      operationId: updateHabit
+      summary: Изменить название и/или описание, сохранив дату начала и историю
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/UpdateHabitRequest"
+      responses:
+        '200':
+          description: Обновлённая сводка; непереданные поля не изменены
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HabitResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '404':
+          "$ref": "#/components/responses/NotFound"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    delete:
+      tags:
+      - Habits
+      operationId: deleteHabit
+      summary: Удалить собственную привычку вместе со всеми выполнениями
+      description: |
+        Подтверждение получает frontend в диалоге; дополнительного поля confirmed нет.
+        Удаление транзакционное и освобождает слот. Архивирования/восстановления нет.
+        Повторное удаление отсутствующей привычки даёт тот же 404, что чужая привычка.
+        Тело запроса не требуется.
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      responses:
+        '204':
+          description: Привычка и история удалены
+          слот освобождён: 
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '404':
+          "$ref": "#/components/responses/NotFound"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    x-upstream: http://habits-service:3000
+    x-preserve-path: true
+  "/api/habits/{habitId}/calendar":
+    parameters:
+    - "$ref": "#/components/parameters/HabitId"
+    get:
+      tags:
+      - Calendar
+      operationId: getHabitCalendar
+      summary: Выполнения и статистика выбранного календарного месяца
+      description: |
+        Без month используется текущий месяц в часовом поясе аккаунта.
+        Переданный month должен быть валидным и принадлежать диапазону от месяца
+        создания привычки до текущего включительно; иначе 400. Frontend нормализует
+        некорректный URL к текущему месяцу до повторного запроса.
+        currentStreak внутри habit всегда относится к today, не к выбранному месяцу.
+        editableFrom/To описывают общее окно привычки, не пересечение с выбранным месяцем.
+        completedDates содержит только даты выбранного месяца, включая старые readonly.
+      parameters:
+      - name: month
+        in: query
+        required: false
+        description: YYYY-MM, годы 0001..9999; не раньше создания и не позже текущего
+          месяца
+        schema:
+          "$ref": "#/components/schemas/CalendarMonth"
+        example: 2026-10
+      responses:
+        '200':
+          description: Согласованный снимок привычки, месяца и календарного контекста
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/CalendarResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '404':
+          "$ref": "#/components/responses/NotFound"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    x-upstream: http://habits-service:3000
+    x-preserve-path: true
+  "/api/habits/{habitId}/completions/{date}":
+    parameters:
+    - "$ref": "#/components/parameters/HabitId"
+    - name: date
+      in: path
+      required: true
+      description: Существующая календарная дата YYYY-MM-DD; проверяется round-trip,
+        а не только regex
+      schema:
+        "$ref": "#/components/schemas/CalendarDate"
+    put:
+      tags:
+      - Calendar
+      operationId: setHabitCompletion
+      summary: Установить желаемое состояние выполнения даты, идемпотентно
+      description: |
+        completed=true создаёт отметку только при её отсутствии; false удаляет её,
+        если существует. Повтор того же запроса не переключает состояние и даёт 200.
+        Дата обязана быть в [max(startDate,D-7),D] включительно. Проверка выполняется
+        после блокировки привычки с заново определённым серверным D.
+        Невозможная/неправильно записанная дата — VALIDATION_ERROR (400);
+        существующая дата вне окна — DATE_NOT_EDITABLE (400), даже для no-op снятия.
+        Ответ содержит подтверждённую сводку; frontend перечитывает выбранный календарь.
+      parameters:
+      - "$ref": "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+              - completed
+              properties:
+                completed:
+                  type: boolean
+            example:
+              completed: true
+      responses:
+        '200':
+          description: Подтверждённое состояние и актуальная сводка привычки
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/CompletionResponse"
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '400':
+          "$ref": "#/components/responses/BadRequest"
+        '401':
+          "$ref": "#/components/responses/Unauthorized"
+        '403':
+          "$ref": "#/components/responses/ForbiddenOrigin"
+        '404':
+          "$ref": "#/components/responses/NotFound"
+        '413':
+          "$ref": "#/components/responses/TooLarge"
+        '415':
+          "$ref": "#/components/responses/UnsupportedMedia"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+      security:
+      - SessionCookie: []
+    x-upstream: http://habits-service:3000
+    x-preserve-path: true
+  "/health":
+    get:
+      tags:
+      - Health
+      operationId: getGatewayHealth
+      summary: Readiness gateway и обоих доменных сервисов
+      description: Без cookie и Origin. Проверяет GET /health auth-service и habits-service;
+        оба включают миграции и собственную БД. Frontend /health должен proxy этот
+        маршрут, а не возвращать статический 200.
+      security: []
+      responses:
+        '200':
+          description: Оба upstream готовы
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                - status
+                - service
+                - upstreams
+                properties:
+                  status:
+                    type: string
+                    const: ok
+                  service:
+                    type: string
+                    const: api-gateway
+                  upstreams:
+                    type: object
+                    additionalProperties: false
+                    required:
+                    - auth-service
+                    - habits-service
+                    properties:
+                      auth-service:
+                        type: string
+                        const: ok
+                      habits-service:
+                        type: string
+                        const: ok
+          headers:
+            X-Request-Id:
+              "$ref": "#/components/headers/RequestId"
+        '503':
+          "$ref": "#/components/responses/Unavailable"
+components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: ritm_session
+      description: HS256 JWT в HttpOnly-cookie; каждый доменный сервис проверяет подпись
+        и persisted session. Браузерный Bearer не используется.
+  parameters:
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      description: Точное значение APP_ORIGIN, включая схему и порт; не вычисляется
+        из Host
+      schema:
+        type: string
+        format: uri
+      example: http://localhost:8880
+    HabitId:
+      name: habitId
+      in: path
+      required: true
+      description: UUID привычки; чужой UUID не раскрывает её существование
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - email
+      - password
+      - timeZone
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Валидация email и длины выполняется после trim + lowercase
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+          description: Без trim/normalization, без требования специальных классов
+            символов
+        timeZone:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Поддерживаемая runtime IANA-зона браузера, включая UTC; навсегда
+            сохраняется в аккаунте
+          example: Europe/Moscow
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - email
+      - password
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: trim + lowercase перед проверкой и поиском
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          writeOnly: true
+          description: При входе короткий неверный пароль даёт INVALID_CREDENTIALS,
+            а не раскрытие аккаунта
+    User:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - email
+      - timeZone
+      - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        timeZone:
+          type: string
+          example: Europe/Moscow
+        createdAt:
+          type: string
+          format: date-time
+    SessionResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - user
+      - expiresAt
+      properties:
+        user:
+          "$ref": "#/components/schemas/User"
+        expiresAt:
+          type: string
+          format: date-time
+      example:
+        user:
+          id: a59e856b-cbf5-4906-a185-e70b3fb731b8
+          email: reader@example.com
+          timeZone: Europe/Moscow
+          createdAt: '2026-10-29T09:00:00Z'
+        expiresAt: '2026-11-05T09:00:00Z'
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+      - error
+      - requestId
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+          - code
+          - message
+          properties:
+            code:
+              type: string
+              pattern: "^[A-Z][A-Z0-9_]*$"
+            message:
+              type: string
+            details:
+              type: object
+              description: Безопасные ошибки полей; пароль, JWT, cookie, service-key,
+                SQL и адреса upstream не включаются
+              additionalProperties:
+                type: string
+        requestId:
+          type: string
+          format: uuid
+    CalendarDate:
+      type: string
+      format: date
+      pattern: "^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+      description: Реальная григорианская дата; например 2026-02-30 запрещено
+    CalendarMonth:
+      type: string
+      pattern: "^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])$"
+    CreateHabitRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: trim перед проверкой; 1–120 Unicode-кодовых точек после trim
+        description:
+          type: string
+          maxLength: 2000
+          default: ''
+          description: Необязательная строка; trim, максимум 2000 Unicode-кодовых
+            точек; null запрещён
+    UpdateHabitRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: trim перед проверкой; пустое название запрещено
+        description:
+          type: string
+          maxLength: 2000
+          description: trim; пустая строка очищает описание; null запрещён
+    HabitSummary:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - description
+      - startDate
+      - createdAt
+      - updatedAt
+      - currentStreak
+      - todayCompleted
+      - recentCompletedDates
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 2000
+        startDate:
+          "$ref": "#/components/schemas/CalendarDate"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        currentStreak:
+          type: integer
+          minimum: 0
+          description: Непрерывная серия до D, если D выполнен; иначе до D-1; при
+            отсутствии обеих отметок 0
+        todayCompleted:
+          type: boolean
+        recentCompletedDates:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            "$ref": "#/components/schemas/CalendarDate"
+          description: Только выполненные даты [D-6,D], не ранее startDate, по возрастанию
+    HabitsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - habits
+      - today
+      - timeZone
+      - limit
+      properties:
+        habits:
+          type: array
+          maxItems: 25
+          items:
+            "$ref": "#/components/schemas/HabitSummary"
+        today:
+          "$ref": "#/components/schemas/CalendarDate"
+        timeZone:
+          type: string
+        limit:
+          type: integer
+          const: 25
+    HabitResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - habit
+      - today
+      - timeZone
+      properties:
+        habit:
+          "$ref": "#/components/schemas/HabitSummary"
+        today:
+          "$ref": "#/components/schemas/CalendarDate"
+        timeZone:
+          type: string
+    CalendarResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - habit
+      - month
+      - completedDates
+      - completedCount
+      - daysInMonth
+      - completionPercent
+      - editableFrom
+      - editableTo
+      - today
+      - timeZone
+      properties:
+        habit:
+          "$ref": "#/components/schemas/HabitSummary"
+        month:
+          "$ref": "#/components/schemas/CalendarMonth"
+        completedDates:
+          type: array
+          maxItems: 31
+          uniqueItems: true
+          items:
+            "$ref": "#/components/schemas/CalendarDate"
+          description: Только выбранный месяц; уникальные даты по возрастанию
+        completedCount:
+          type: integer
+          minimum: 0
+          maximum: 31
+        daysInMonth:
+          type: integer
+          minimum: 28
+          maximum: 31
+        completionPercent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: completedCount / daysInMonth * 100, без серверного округления;
+            UI показывает один десятичный знак
+        editableFrom:
+          "$ref": "#/components/schemas/CalendarDate"
+          description: max(startDate,D-7), независимо от выбранного месяца
+        editableTo:
+          "$ref": "#/components/schemas/CalendarDate"
+          description: D в подтверждённом часовом поясе аккаунта
+        today:
+          "$ref": "#/components/schemas/CalendarDate"
+        timeZone:
+          type: string
+      example:
+        habit:
+          id: 56b1f554-bccc-4c4d-a7ac-91b44c821dd1
+          name: Читать 20 минут
+          description: Несколько страниц каждый вечер
+          startDate: '2026-10-01'
+          createdAt: '2026-10-01T07:00:00Z'
+          updatedAt: '2026-10-29T07:00:00Z'
+          currentStreak: 3
+          todayCompleted: true
+          recentCompletedDates:
+          - '2026-10-27'
+          - '2026-10-28'
+          - '2026-10-29'
+        month: 2026-10
+        completedDates:
+        - '2026-10-27'
+        - '2026-10-28'
+        - '2026-10-29'
+        completedCount: 3
+        daysInMonth: 31
+        completionPercent: 9.67741935483871
+        editableFrom: '2026-10-22'
+        editableTo: '2026-10-29'
+        today: '2026-10-29'
+        timeZone: Europe/Moscow
+    CompletionResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - habit
+      - date
+      - completed
+      - today
+      - timeZone
+      properties:
+        habit:
+          "$ref": "#/components/schemas/HabitSummary"
+        date:
+          "$ref": "#/components/schemas/CalendarDate"
+        completed:
+          type: boolean
+        today:
+          "$ref": "#/components/schemas/CalendarDate"
+        timeZone:
+          type: string
+  responses:
+    BadRequest:
+      description: VALIDATION_ERROR — невалидные JSON/поля/UUID/дата/месяц/timeZone;
+        MONTH_OUT_OF_RANGE — месяц вне диапазона; DATE_NOT_EDITABLE — дата вне окна
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    Unauthorized:
+      description: UNAUTHENTICATED — JWT отсутствует/неверен/истёк либо persisted
+        session неактивна; неверные credentials входа описаны отдельно
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    ForbiddenOrigin:
+      description: ORIGIN_FORBIDDEN — Origin отсутствует, равен null или не совпадает
+        с APP_ORIGIN
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    TooLarge:
+      description: PAYLOAD_TOO_LARGE — тело превышает 16 KiB
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    UnsupportedMedia:
+      description: UNSUPPORTED_MEDIA_TYPE — непустое тело не имеет Content-Type application/json
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    Unavailable:
+      description: SERVICE_UNAVAILABLE — БД или upstream недоступен/не готов, timeout
+        либо некорректный внутренний ответ; доступ не разрешается
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    NotFound:
+      description: HABIT_NOT_FOUND — одинаковый ответ для неизвестной, удалённой и
+        чужой привычки
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: HABIT_NOT_FOUND
+              message: Привычка не найдена
+            requestId: 8e4bbd73-ac3f-47f6-bf95-48384e4feaa8
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+    GatewayNotFound:
+      description: NOT_FOUND — неизвестный публичный API-путь/метод или запрещённый
+        внутренний маршрут
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/ErrorEnvelope"
+      headers:
+        X-Request-Id:
+          "$ref": "#/components/headers/RequestId"
+  headers:
+    RequestId:
+      description: UUID запроса, созданный gateway; совпадает с requestId тела ошибки
+      schema:
+        type: string
+        format: uuid

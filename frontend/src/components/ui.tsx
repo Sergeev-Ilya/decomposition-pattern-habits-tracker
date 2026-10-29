@@ -1,0 +1,10 @@
+import { Icon } from './Icon';
+import type { Habit } from '../api/types';
+export const primaryButton = 'inline-flex items-center justify-center gap-2 rounded-xl bg-[#244e40] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#183e31] focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#244e40] disabled:cursor-not-allowed disabled:opacity-50';
+export const secondaryButton = 'inline-flex items-center justify-center gap-2 rounded-xl border border-[#dfe3d9] bg-white px-4 py-2.5 text-sm font-medium text-[#36483e] transition hover:bg-[#f3f5ef] focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#244e40] disabled:opacity-40 disabled:cursor-not-allowed';
+export const inputClass = 'mt-2 w-full rounded-xl border border-[#d9ded4] bg-white px-4 py-3 text-[15px] text-[#263e32] outline-none transition placeholder:text-[#9aa299] focus:border-[#56816a] focus:ring-3 focus:ring-[#dfe9dc]';
+export const iconColors: Record<string, string> = { sage: 'bg-[#eaf0e2] text-[#53744e]', clay: 'bg-[#f7e9df] text-[#b57652]', blue: 'bg-[#e7eef1] text-[#608498]', gold: 'bg-[#f8efd7] text-[#a78a3c]' };
+export function HabitSymbol({ habit, large = false }: { habit: Habit; large?: boolean }) { return <span className={`inline-flex shrink-0 items-center justify-center rounded-2xl ${large ? 'h-16 w-16' : 'h-12 w-12'} ${iconColors[['sage','clay','blue','gold'][symbolIndex(habit.id) % 4]]}`}><Icon name="leaf" className={large ? 'h-7 w-7' : 'h-6 w-6'}/></span>; }
+export function Brand({ light = false }: { light?: boolean }) { return <span className={`inline-flex items-center gap-2.5 ${light ? 'text-[#f6f5ec]' : 'text-[#244e40]'}`}><span className={`flex h-9 w-9 items-center justify-center rounded-xl ${light ? 'bg-[#43654e]' : 'bg-[#e2eadb]'}`}><Icon name="leaf" className="h-6 w-6"/></span><span className="text-[28px] font-semibold tracking-[-1px]">ритм<span className="text-[#a4bd7d]">.</span></span></span>; }
+
+function symbolIndex(id: string) { return Array.from(id).reduce((sum, character) => sum + character.charCodeAt(0), 0); }

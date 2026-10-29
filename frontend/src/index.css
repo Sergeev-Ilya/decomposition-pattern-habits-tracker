@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+body { @apply bg-[#f7f8f2] text-[#293f32] antialiased; }
+button, a, input, textarea { @apply focus-visible:outline-offset-4; }
+button:not(:disabled), a { @apply cursor-pointer; }
