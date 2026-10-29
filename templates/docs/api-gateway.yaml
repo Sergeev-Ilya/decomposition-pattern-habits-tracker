@@ -1,0 +1,85 @@
+openapi: 3.1.0
+info:
+  title: API Gateway
+  version: 1.0.0
+  description: |
+    Single entry point for frontend. Routes /api/* to upstream microservices.
+    Merge paths from docs/{service}/api.yaml — replace upstream URLs and path prefixes.
+    Browser hits {baseUrl}/api/* via frontend nginx; gateway listens on :8080 inside Docker network.
+
+servers:
+  - url: http://localhost:8080
+    description: Local API Gateway (direct debug — not the SPA origin in production)
+
+paths:
+  /health:
+    get:
+      summary: Gateway health
+      operationId: gatewayHealth
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/auth/{proxy+}:
+    x-upstream: http://auth-service:3000
+    get:
+      summary: Proxy to auth-service
+      operationId: proxyAuthGet
+      parameters:
+        - name: proxy
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proxied response
+
+  /api/catalog/{proxy+}:
+    x-upstream: http://catalog-service:3000
+    get:
+      summary: Proxy to catalog-service
+      operationId: proxyCatalogGet
+      parameters:
+        - name: proxy
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proxied response
+
+  /api/orders/{proxy+}:
+    x-upstream: http://order-service:3000
+    get:
+      summary: Proxy to order-service
+      operationId: proxyOrdersGet
+      parameters:
+        - name: proxy
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proxied response
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - bearerAuth: []
